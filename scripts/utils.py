@@ -1,5 +1,6 @@
 # scripts/utils.py
 # Small helper functions used by ingestion/transforms
+# helpers (normalize column names, parse helpers, safe SQL write)
 
 import re
 import pandas as pd
