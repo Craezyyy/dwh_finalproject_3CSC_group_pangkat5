@@ -393,34 +393,69 @@ def build_fact_orders():
     return cur
 
 def build_fact_line_items():
-    parts = []
-    for t in ['stg_line_item_data_prices1', 'stg_line_item_data_prices2', 'stg_line_item_data_prices3',
-              'stg_line_item_data_products1', 'stg_line_item_data_products2', 'stg_line_item_data_products3']:
+    # Load price tables
+    price_parts = []
+    for t in ['stg_line_item_data_prices1', 'stg_line_item_data_prices2', 'stg_line_item_data_prices3']:
         df = safe_read_table(t)
         if not df.empty:
-            parts.append(df)
-    if not parts:
+            price_parts.append(df)
+    price_df = pd.concat(price_parts, ignore_index=True, sort=False) if price_parts else pd.DataFrame()
+
+    # Load product tables
+    prod_parts = []
+    for t in ['stg_line_item_data_products1', 'stg_line_item_data_products2', 'stg_line_item_data_products3']:
+        df = safe_read_table(t)
+        if not df.empty:
+            prod_parts.append(df)
+    prod_df = pd.concat(prod_parts, ignore_index=True, sort=False) if prod_parts else pd.DataFrame()
+
+    if price_df.empty and prod_df.empty:
         print("[WARN] no line item files found")
         return pd.DataFrame()
-    li = pd.concat(parts, ignore_index=True, sort=False)
 
-    # normalize
-    if 'order_id' in li.columns:
-        li['order_id'] = li['order_id'].astype(str).str.strip()
-    if 'product_id' in li.columns:
-        li['product_id'] = li['product_id'].astype(str).str.strip()
+    # Ensure order_id is string
+    if 'order_id' in price_df.columns:
+        price_df['order_id'] = price_df['order_id'].astype(str).str.strip()
+    if 'order_id' in prod_df.columns:
+        prod_df['order_id'] = prod_df['order_id'].astype(str).str.strip()
 
-    # numeric
-    for c in ['price', 'item_price', 'amount', 'quantity']:
-        if c in li.columns:
-            li[c] = li[c].apply(safe_numeric)
+    # Because there is no explicit line_item_id, align by row number per order (stable synthetic dataset pattern)
+    if not price_df.empty:
+        price_df['rn'] = price_df.groupby('order_id').cumcount()
+    if not prod_df.empty:
+        prod_df['rn'] = prod_df.groupby('order_id').cumcount()
 
-    # dedupe by line-item id if exists
-    if 'line_item_id' in li.columns:
-        li = li.sort_values('order_id').drop_duplicates(subset=['line_item_id'], keep='first').reset_index(drop=True)
+    # Merge on order_id + rn
+    if not price_df.empty and not prod_df.empty:
+        merged = price_df.merge(prod_df, on=['order_id', 'rn'], how='inner')
+        merged.drop(columns=['rn'], inplace=True)
+    elif not price_df.empty:
+        # Only price info present (no product mapping) -> keep price rows, add empty product cols
+        merged = price_df.copy()
+        merged['product_id'] = None
+        merged['product_name'] = None
+    else:
+        # Only product info present -> keep product rows, add empty price cols
+        merged = prod_df.copy()
+        merged['price'] = None
+        merged['quantity'] = None
 
-    to_sql(li, 'cur_fact_line_items')
-    return li
+    # Clean numeric
+    if 'price' in merged.columns:
+        merged['price'] = merged['price'].apply(safe_numeric)
+    if 'quantity' in merged.columns:
+        merged['quantity'] = merged['quantity'].apply(safe_numeric)
+
+    # Final curated columns
+    # Keep columns that exist and are relevant
+    final_cols = []
+    for c in ['order_id', 'product_id', 'product_name', 'price', 'quantity']:
+        if c in merged.columns:
+            final_cols.append(c)
+    final = merged[final_cols].copy()
+
+    to_sql(final, 'cur_fact_line_items')
+    return final
 
 def clean_order_delays():
     df = safe_read_table('stg_order_delays')
